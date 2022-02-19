@@ -2,13 +2,12 @@ import re
 import socketserver
 import secrets
 from time import time
-
-
-registry = {}
+import logging
 
 
 class SIPProxy(socketserver.BaseRequestHandler):
 
+    NOTIFICATION = re.compile(r'(SUBSCRIBE|PUBLISH|NOTIFY)')
     FROM = re.compile(r'^From\s*:', re.I)
     TO = re.compile(r'^To\s*:', re.I)
 
@@ -17,6 +16,7 @@ class SIPProxy(socketserver.BaseRequestHandler):
     ROUTE = re.compile(r'^Route\s*:', re.I)
     CONTACT = re.compile(r'^Contact\s*:', re.I)
     EXPIRES = re.compile(r'^Expires\s*:\s*(.*)$', re.I)
+    STATUS_CODE = re.compile(r'^SIP/2.0 ([^ ]*)', re.I)
 
     SIP_URI = re.compile(r'sip:([^@]*)@([^;>$]*)')
     EXPIRES_OPT = re.compile(r'expires=([^;$]*)')
@@ -24,11 +24,23 @@ class SIPProxy(socketserver.BaseRequestHandler):
     RPORT_OPT = re.compile(r';rport$|;rport;')
     VIA_HEADER = 'Via: SIP/2.0/UDP 192.168.1.103:5060'
 
-    def expired(target):
-        available = registry[target]['validity'] > int(time())
-        if not available:
+    def expired(self, target):
+        gone = registry[target]['validity'] <= int(time())
+        if gone:
             registry.pop(target, None)
-        return available
+        return gone
+
+    def participants(self):
+        return (
+            self.find_client(self.FROM),
+            self.find_client(self.TO)
+        )
+
+    def find_client(self, direction):
+        for header in self.headers:
+            if direction.match(header):
+                if (m := re.search(self.SIP_URI, header)) is not None:
+                    return f'{m.group(1)}@{m.group(2)}'
 
     def response(self, code):
         self.headers[0] = f'SIP/2.0 {code}'
@@ -54,12 +66,6 @@ class SIPProxy(socketserver.BaseRequestHandler):
         message = '\r\n'.join(self.headers).encode('utf8')
         self.socket.sendto(message, self.client_address)
 
-    def find_client(self, direction):
-        for header in self.headers:
-            if direction.match(header):
-                if (m := re.search(self.SIP_URI, header)) is not None:
-                    return f'{m.group(1)}@{m.group(2)}'
-
     def sip_register(self):
         for header in self.headers:
             if self.TO.match(header):
@@ -79,40 +85,42 @@ class SIPProxy(socketserver.BaseRequestHandler):
             registry.pop(source, None)
         else:
             validity = int(time()) + expires
+            change = source not in registry
+
             registry[source] = {
                 'socket': self.socket,
                 'contact': contact,
                 'client': self.client_address,
                 'validity': validity
             }
-
-        self.response('200 0K')
+            if change:
+                logging.info(f'{source} sa registroval na ústredni: {list(registry.keys())}')
 
     def sip_invite(self):
         source = self.find_client(self.FROM)
         if not source or source not in registry:
-            return self.response('400 Bad Request')
+            return self.response('400 Volajúci nie je registrovaný')
 
         destination = self.find_client(self.TO)
         if not destination:
-            return self.response('500 Server Internal Error')
+            return self.response('500 Interná chyba servera')
 
-        if destination not in registry and self.expired(destination):
-            return self.response('480 Temporarily Unavailable')
+        if destination not in registry or self.expired(destination):
+            return self.response('480 Volaný je dočasne nedostupný')
 
         self.resend(destination)
 
     def sip_other(self):
         source = self.find_client(self.FROM)
         if not source or source not in registry:
-            return self.response('400 Bad Request')
+            return self.response('400 Volajúci nie je registrovaný')
 
         destination = self.find_client(self.TO)
         if not destination:
-            return self.response('500 Server Internal Error')
+            return self.response('500 Interná chyba servera')
 
-        if destination not in registry and self.expired(destination):
-            return self.response('406 Not Acceptable')
+        if destination not in registry or self.expired(destination):
+            return self.response('406 Neprijateľné')
 
         self.resend(destination)
 
@@ -157,17 +165,47 @@ class SIPProxy(socketserver.BaseRequestHandler):
         if request and 'SIP/2.0' in request:
             if request.startswith('REGISTER'):
                 self.sip_register()
-                print(registry)
+                self.response('200 0K')
+
             elif request.startswith('INVITE'):
                 self.sip_invite()
+
+                a, b = self.participants()
+                if a not in calling:
+                    logging.info(f'{a} volá {b}')
+                    calling.update((a, b))
+
             elif request.startswith('ACK'):
                 self.resend_to_destination()
-            elif re.search('^SIP/2.0 ([^ ]*)', request):  # Code
+
+                a, b = self.participants()
+                if a in calling:
+                    logging.info(f'{b} prijal hovor od {a}')
+
+            elif request.startswith('BYE'):
+                self.sip_other()
+
+                a, b = self.participants()
+                if b in calling:
+                    logging.info(f'{a} ukončil hovor od {b}')
+                    calling.difference_update((a, b))
+
+            elif self.STATUS_CODE.match(request):
                 self.resend_to_source()
+            elif self.NOTIFICATION.match(request):
+                self.response('200 0K')
             else:
                 self.sip_other()
 
 
 if __name__ == '__main__':
+    registry = {}
+    calling = set()
+    logging.basicConfig(
+        filename='call.log',
+        level=logging.INFO,
+        format='%(asctime)s %(message)s',
+        datefmt='%d.%m.%Y %H:%M:%S'
+    )
     proxy = socketserver.UDPServer(('0.0.0.0', 5060), SIPProxy)
     proxy.serve_forever()
