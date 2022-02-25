@@ -1,22 +1,27 @@
 import re
 import socketserver
-import secrets
 from time import time
 import logging
 
 
+registry = {}
+calling = set()
+
+
 class SIPProxy(socketserver.BaseRequestHandler):
 
-    NOTIFICATION = re.compile(r'(SUBSCRIBE|PUBLISH|NOTIFY)')
     FROM = re.compile(r'^From\s*:', re.I)
     TO = re.compile(r'^To\s*:', re.I)
 
+    NOTIFICATION = re.compile(r'(SUBSCRIBE|PUBLISH|NOTIFY)')
     CONTENT_LENGTH = re.compile(r'^Content-Length:\s*:', re.I)
     VIA = re.compile(r'^(Via|v)\s*:', re.I)
+    CALL_ID = re.compile(r'^Call-ID\s*:\s*(.*)$', re.I)
     ROUTE = re.compile(r'^Route\s*:', re.I)
     CONTACT = re.compile(r'^Contact\s*:', re.I)
     EXPIRES = re.compile(r'^Expires\s*:\s*(.*)$', re.I)
-    STATUS_CODE = re.compile(r'^SIP/2.0 ([^ ]*)', re.I)
+    STATUS_CODE = re.compile(r'^SIP/2.0 ([^ ]*)')
+    SIP_CODE = re.compile(r'^SIP/2.0\s+(\d+)')
 
     SIP_URI = re.compile(r'sip:([^@]*)@([^;>$]*)')
     EXPIRES_OPT = re.compile(r'expires=([^;$]*)')
@@ -42,13 +47,17 @@ class SIPProxy(socketserver.BaseRequestHandler):
                 if (m := re.search(self.SIP_URI, header)) is not None:
                     return f'{m.group(1)}@{m.group(2)}'
 
+    def call_id(self):
+        for header in self.headers:
+            if (m := re.search(self.CALL_ID, header)) is not None:
+                return f'{m.group(1)}'
+
     def response(self, code):
         self.headers[0] = f'SIP/2.0 {code}'
 
         for i, header in enumerate(self.headers):
             if self.TO.match(header) is not None and ';tag' not in header:
-                tag = secrets.token_urlsafe(4)
-                self.headers[i] = f'{header};tag={tag}'
+                self.headers[i] = f'{header};tag=123456'
 
             elif self.VIA.match(header):
                 if ';rport' in header:
@@ -99,28 +108,28 @@ class SIPProxy(socketserver.BaseRequestHandler):
     def sip_invite(self):
         source = self.find_client(self.FROM)
         if not source or source not in registry:
-            return self.response('400 Volajúci nie je registrovaný')
+            return self.response('400 Volajuci nie je registrovany')
 
         destination = self.find_client(self.TO)
         if not destination:
             return self.response('500 Interná chyba servera')
 
         if destination not in registry or self.expired(destination):
-            return self.response('480 Volaný je dočasne nedostupný')
+            return self.response('480 Volany je docasne nedostupny')
 
         self.resend(destination)
 
     def sip_other(self):
         source = self.find_client(self.FROM)
         if not source or source not in registry:
-            return self.response('400 Volajúci nie je registrovaný')
+            return self.response('400 Volajuci nie je registrovany')
 
         destination = self.find_client(self.TO)
         if not destination:
-            return self.response('500 Interná chyba servera')
+            return self.response('500 Interna chyba servera')
 
         if destination not in registry or self.expired(destination):
-            return self.response('406 Neprijateľné')
+            return self.response('406 Neprijatelne')
 
         self.resend(destination)
 
@@ -159,7 +168,10 @@ class SIPProxy(socketserver.BaseRequestHandler):
 
     def handle(self):
         message, self.socket = self.request
-        self.headers = message.decode('utf8').split('\r\n')
+        try:
+            self.headers = message.decode('utf8').split('\r\n')
+        except Exception:
+            return
         request = self.headers[0]
 
         if request and 'SIP/2.0' in request:
@@ -171,41 +183,48 @@ class SIPProxy(socketserver.BaseRequestHandler):
                 self.sip_invite()
 
                 a, b = self.participants()
-                if a not in calling:
-                    logging.info(f'{a} volá {b}')
-                    calling.update((a, b))
+                call = self.call_id()
+                if call not in calling:
+                    logging.info(f'Hovor: {call} , <{a}> volá účastníka <{b}>')
+                    calling.add(call)
 
             elif request.startswith('ACK'):
                 self.resend_to_destination()
 
                 a, b = self.participants()
-                if a in calling:
-                    logging.info(f'{b} prijal hovor od {a}')
-
-            elif request.startswith('BYE'):
-                self.sip_other()
-
-                a, b = self.participants()
-                if b in calling:
-                    logging.info(f'{a} ukončil hovor od {b}')
-                    calling.difference_update((a, b))
+                call = self.call_id()
+                if call in calling:
+                    logging.info(f'Hovor: {call}, <{b}> prijal hovor od <{a}>')
 
             elif self.STATUS_CODE.match(request):
+                if (m := self.SIP_CODE.match(request)) is not None:
+                    code = m.group(1)
+                    if code == '486':
+                        self.headers[0] = f'SIP/2.0 {code} Obsadene'
+                    if code == '100':
+                        self.headers[0] = f'SIP/2.0 {code} Volame'
+                    if code == '603' or code == '486':
+                        a, b = self.participants()
+                        call = self.call_id()
+                        if call in calling:
+                            logging.info(f'Hovor: {call}, <{b}> odmietol hovor od <{a}>')
+                            calling.remove(call)
+
                 self.resend_to_source()
-            elif self.NOTIFICATION.match(request):
-                self.response('200 0K')
+
             else:
                 self.sip_other()
 
+                if request.startswith('BYE'):
+                    a, b = self.participants()
+                    call = self.call_id()
+                    if call in calling:
+                        logging.info(f'Hovor: {call}, <{a}> ukončil hovor od <{b}>')
+                        calling.remove(call)
 
-if __name__ == '__main__':
-    registry = {}
-    calling = set()
-    logging.basicConfig(
-        filename='call.log',
-        level=logging.INFO,
-        format='%(asctime)s %(message)s',
-        datefmt='%d.%m.%Y %H:%M:%S'
-    )
-    proxy = socketserver.UDPServer(('0.0.0.0', 5060), SIPProxy)
-    proxy.serve_forever()
+                elif request.startswith('CANCEL'):
+                    a, b = self.participants()
+                    call = self.call_id()
+                    if call in calling:
+                        logging.info(f'Hovor: {call}, <{a}> zrušil hovor ku <{b}>')
+                        calling.remove(call)
