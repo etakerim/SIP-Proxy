@@ -2,6 +2,7 @@ import re
 import socketserver
 from time import time
 import logging
+import settings
 
 
 registry = {}
@@ -27,7 +28,9 @@ class SIPProxy(socketserver.BaseRequestHandler):
     EXPIRES_OPT = re.compile(r'expires=([^;$]*)')
     BRANCH_OPT = re.compile(r';branch=([^;]*)')
     RPORT_OPT = re.compile(r';rport$|;rport;')
-    VIA_HEADER = 'Via: SIP/2.0/UDP 192.168.1.103:5060'
+
+    VIA_HEADER = f'Via: SIP/2.0/UDP {settings.SIP_IP}:{settings.SIP_PORT}'
+    RECORD_ROUTE = f'Record-Route: <sip:{settings.SIP_IP}:{settings.SIP_PORT};lr>'
 
     def expired(self, target):
         gone = registry[target]['validity'] <= int(time())
@@ -102,6 +105,7 @@ class SIPProxy(socketserver.BaseRequestHandler):
                 'client': self.client_address,
                 'validity': validity
             }
+            print(registry)
             if change:
                 logging.info(f'{source} sa registroval na ústredni: {list(registry.keys())}')
 
@@ -146,7 +150,7 @@ class SIPProxy(socketserver.BaseRequestHandler):
         response = []
         for header in self.headers:
             if len(response) == 1:
-                response.append('Record-Route: <sip:192.168.1.103:5060;lr>')
+                response.append(self.RECORD_ROUTE)
 
             if self.VIA.match(header):
                 if (m := self.BRANCH_OPT.search(header)) is not None:
@@ -211,6 +215,9 @@ class SIPProxy(socketserver.BaseRequestHandler):
                             calling.remove(call)
 
                 self.resend_to_source()
+
+            elif self.NOTIFICATION.match(request):
+                self.response('200 0K')
 
             else:
                 self.sip_other()
